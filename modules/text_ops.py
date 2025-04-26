@@ -54,23 +54,23 @@ def process_text(text: str, chat: DeepSeekClient, sample_name: str, result_dir: 
         "2. Сохранить только данные, относящиеся непосредственно к пациенту\n"
         "3. Если информации о родственниках нет — вернуть исходный текст"
     )
-    processed = chat.ask(processed, prompt, temperature=1.0)
+    processed = chat.ask(processed, prompt, temperature=0.3)
     prompt = (
         "Ты должен:\n1. Удалить из текста ВСЕ упоминания результатов анализов\n"
         "2. Оставить только симптомы, жалобы и диагнозы\n"
         "3. Если анализов нет — вернуть текст без изменений"
     )
-    processed = chat.ask(processed, prompt, temperature=1.0)
+    processed = chat.ask(processed, prompt, temperature=0.3)
     prompt = (
         "Ты должен:\n1. Удалить из текста ВСЕ даты\n2. Удалить административные данные\n"
         "3. Оставить только медицинскую информацию\n4. Если таких данных нет — вернуть исходный текст"
     )
-    processed = chat.ask(processed, prompt, temperature=1.0)
+    processed = chat.ask(processed, prompt, temperature=0.3)
     prompt = (
         "Ты должен:\n1. Извлечь из текста ТОЛЬКО информацию о фенотипе, симптомах, диагнозах\n"
         "2. Удалить всё остальное\n"
         "3. Если текст уже содержит только нужные данные — вернуть его без изменений"
     )
-    processed = chat.ask(processed, prompt, temperature=1.0)
+    processed = chat.ask(processed, prompt, temperature=0.3)
     write_text(processed, "_processed_text", sample_name, result_dir)
     return processed
