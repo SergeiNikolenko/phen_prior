@@ -41,7 +41,7 @@ cp ../output/* /mnt/
 
 
 
-DOCKER_TIMEOUT = 60 * 15          # 15 мин
+DOCKER_TIMEOUT = 60 * 60          # 1 час
 
 def _check_docker():
     if shutil.which("docker") is None:
@@ -67,6 +67,7 @@ def execute_phenotagger(text: str) -> str:
         "-v", f"{RESULT_DIR.resolve()}:/mnt",
         "albertea/phenotagger:1.2",
         f"/mnt/{script_path.name}",
+        "--gpus", "all"
     ]
 
     start = time.time()

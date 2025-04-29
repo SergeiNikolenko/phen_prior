@@ -12,3 +12,5 @@ wheels/
 
 result/*
 uv.lock
+FND00006610.vcf/*
+.DS_Store
