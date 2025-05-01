@@ -1,4 +1,3 @@
-# modules/text_ops.py
 import re
 from pathlib import Path
 import nltk
@@ -29,20 +28,20 @@ def process_text(text: str, chat: DeepSeekClient, sample_name: str, result_dir: 
         p1, p2 = split_text(text)
         return process_text(p1, chat, sample_name, result_dir) + "\n" + process_text(p2, chat, sample_name, result_dir)
     prompt = (
-        "You are a senior clinical translator. Receive Russian medical text and convert it into a fluent English "
-        "clinical narrative suitable for automated phenotypic annotation by PhenoTagger (PubTator).\n\n"
-        "Output REQUIREMENTS:\n"
-        "- Return a continuous paragraph (or several full sentences) of plain text, no bullet points, no numbering.\n"
-        "- Do NOT append HPO codes, summaries or any extra commentary.\n\n"
-        "Steps you must follow:\n"
-        "1. Translate the entire text to English, preserving accurate medical terminology.\n"
-        "2. Expand every Russian or Latin abbreviation to its full form.\n"
-        "3. Correct all spelling and grammar errors.\n"
-        "4. Remove personal identifiers (names, addresses, record numbers, hospital names) and specific calendar dates; keep relative durations (e.g. “for three months”).\n"
-        "5. KEEP every clinically relevant statement about the patient: symptoms, signs, diagnoses, procedures, anatomical descriptions, and observable findings.\n"
-        "6. Remove laboratory numeric values, medication lists, treatment recommendations and administrative details.\n"
-        "7. Preserve explicit negations (e.g. \"no fever\", \"no seizures\") in the same sentence—they improve downstream NER.\n\n"
-        "Return ONLY the cleaned English clinical narrative text."
+        "You are a senior clinical translator. Translate the following text into English. Perform the following steps in strict order "
+        "and return ONE final text without any comments, explanations or metadata.\n\n"
+        "1. Correct all spelling and grammatical errors, especially in medical terms.\n"
+        "2. Identify all abbreviations and replace each with its full expansion, leaving the rest of the text unchanged.\n"
+        "3. Remove any information about the patient's mother, father and other relatives; keep only data that relate to the patient.\n"
+        "4. Remove all test and investigation results (laboratory values, MRI, CT, etc.); keep only symptoms, complaints and diagnoses.\n"
+        "5. Remove all dates and administrative data (chart numbers, addresses, contacts, institution names).\n"
+        "6. In the final text keep ONLY:\n"
+        "   – the patient's phenotype (age, sex, external appearance if any);\n"
+        "   – symptoms and diagnoses;\n"
+        "   – test results that are directly related to the diagnosis.\n"
+        "   Remove everything else: recommendations, reasoning, references, irrelevant details.\n\n"
+        "If a step leaves no corresponding information, simply proceed to the next step; the final text must contain only "
+        "the required data without additional explanations."
     )
     processed = chat.ask(text, prompt, temperature=0.1)
     write_text(prompt, "_02_prompt", sample_name, result_dir)
