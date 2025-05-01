@@ -20,10 +20,9 @@ def adjust_positions(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def modify_sqlite(sqlite_path: Path, sample_name: str, result_dir: Path):
-    csv_path = result_dir / f"{sample_name}_clinprior.csv"
+    csv_path = result_dir / f"{sample_name}_05_clinprior.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"ClinPrior CSV not found: {csv_path}")
-    
     conn = sqlite3.connect(sqlite_path)
     rows = conn.execute("SELECT base__uid, base__hugo, intervar_new__ACMG FROM variant;").fetchall()
     df = pd.DataFrame(rows, columns=["base__uid", "Gene", "ACMG"])

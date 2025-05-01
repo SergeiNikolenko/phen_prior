@@ -1,12 +1,12 @@
 from pathlib import Path
-import re
+import asyncio
 import shutil
-import multiprocessing
-from typing import Optional, List
-from joblib import Parallel, delayed
+from typing import Optional, List, Callable
+from concurrent.futures import ThreadPoolExecutor
+
+from joblib import cpu_count
 import nltk
 import typer
-
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -16,7 +16,9 @@ from rich.progress import (
     TaskProgressColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+    Group,
 )
+from rich.live import Live
 
 from modules.utils import (
     load_config,
@@ -38,19 +40,19 @@ class Pipeline:
         self,
         med_doc: Path,
         sqlite_path: Path,
-        config_path: Optional[Path],
+        api_key: Optional[str],
         output_dir: Path,
-        log_level: str,
         show_progress: bool = True,
+        tail_cb: Optional[Callable[[str], None]] = None,
     ):
         self.med_doc = med_doc
         self.sqlite_path = sqlite_path
-        self.sample_name = sqlite_path.stem
-        api_key = load_config(config_path)
-        self.chat = DeepSeekClient(api_key=api_key)
+        self.sample_name = sqlite_path.stem.split(".", 1)[0]
         self.result_dir = output_dir
         self.show_progress = show_progress
-        self.log = setup_logging_file_only(self.result_dir / "pipeline.log", log_level)
+        self.chat = DeepSeekClient(api_key=api_key)
+        if tail_cb:
+            self.chat.tail_cb = tail_cb
 
     def run(self):
         nltk.download("punkt", quiet=True)
@@ -66,17 +68,24 @@ class Pipeline:
             if self.show_progress
             else None
         )
-
         if ctx:
             ctx.__enter__()
             steps = ctx.add_task("Step 1/6: Reading medical doc", total=6)
+            tail_task = ctx.add_task("", total=None)
 
-        def step(msg):
+            def _tail_update(t: str):
+                ctx.update(
+                    tail_task,
+                    description=t.replace("\n", " ").replace("\r", " ")[:100],
+                )
+
+            self.chat.tail_cb = _tail_update
+
+        def step(msg: str):
             log.info(msg)
             if ctx:
                 ctx.update(steps, advance=1, description=msg)
 
-        step("Step 1/6: Reading medical doc")
         text = self.med_doc.read_text(encoding="utf-8")
 
         step("Step 2/6: Processing text")
@@ -124,66 +133,87 @@ def _collect_docs(folder: Path) -> List[Path]:
     return list(folder.rglob("*.txt"))
 
 
-def _process_doc(
+def _is_output_complete(out_dir: Path, sample_name: str) -> bool:
+    expected = [
+        out_dir / f"{sample_name}_02_processed_text.txt",
+        out_dir / f"{sample_name}_04_filtered_terms.txt",
+        out_dir / f"{sample_name}_05_clinprior.csv",
+    ]
+    return all(p.exists() for p in expected)
+
+
+def _run_pipeline_sync(
     med_doc: Path,
     sqlite_path: Path,
     output_root: Path,
+    api_key: Optional[str],
+    bar_progress: Progress,
+    bar_id: int,
+    tail_progress: Progress,
+    tail_id: int,
+):
+    sample_name = sqlite_path.stem.split(".", 1)[0]
+    out_dir = output_root / f"result_{sample_name}" / med_doc.stem
+    try:
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _tail_update(msg: str):
+            tail_progress.update(tail_id, description=msg[:100])
+
+        Pipeline(
+            med_doc,
+            sqlite_path,
+            api_key,
+            out_dir,
+            show_progress=False,
+            tail_cb=_tail_update,
+        ).run()
+        bar_progress.update(bar_id, advance=1)
+        return True
+    except Exception as e:
+        (out_dir / "error.txt").write_text(str(e))
+        log.error(f"FAILED {med_doc}: {e}")
+        bar_progress.update(bar_id, advance=1)
+        return False
+
+
+async def _process_doc_async(
+    sem: asyncio.Semaphore,
+    loop,
+    executor,
+    med_doc: Path,
+    sqlite_path: Path,
+    output_root: Path,
+    api_key: Optional[str],
+    bar_progress: Progress,
+    bar_id: int,
+    tail_progress: Progress,
+    tail_id: int,
+):
+    async with sem:
+        return await loop.run_in_executor(
+            executor,
+            _run_pipeline_sync,
+            med_doc,
+            sqlite_path,
+            output_root,
+            api_key,
+            bar_progress,
+            bar_id,
+            tail_progress,
+            tail_id,
+        )
+
+
+async def _batch_async(
+    docs_dir: Path,
+    sqlite_path: Path,
+    output_root: Optional[Path],
     config: Optional[Path],
     log_level: str,
-    progress: Progress,
-    task_id: int,
-):
-    sample_name = sqlite_path.stem
-    out_dir = output_root / f"result_{sample_name}" / med_doc.stem
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
-    Pipeline(
-        med_doc,
-        sqlite_path,
-        config,
-        out_dir,
-        log_level,
-        show_progress=False,
-    ).run()
-    progress.update(task_id, advance=1)
-
-
-@app.command()
-def batch(
-    docs_dir: Path = typer.Option(
-        BASE_DIR / "../med_docs",
-        "-d",
-        "--docs-dir",
-        help="Directory with .txt files (recursive)",
-    ),
-    sqlite_path: Path = typer.Option(
-        BASE_DIR / "../FND00006610.vcf.sqlite",
-        "-s",
-        "--sqlite",
-        help="Path to single sqlite used for all documents",
-    ),
-    output_root: Optional[Path] = typer.Option(
-        None,
-        "-o",
-        "--output-root",
-        help="Root directory for result_* folders (default: one level above docs_dir)",
-    ),
-    config: Optional[Path] = typer.Option(
-        BASE_DIR / "data/tokenizer_config.json",
-        "-c",
-        "--config",
-        help="Path to JSON with API key",
-    ),
-    log_level: str = typer.Option(
-        "info", "--log-level", help="Log level (debug, info, warning, error)"
-    ),
-    workers: int = typer.Option(
-        4,
-        "-w",
-        "--workers",
-        help="Number of parallel workers (default = 4)",
-    ),
+    workers: int,
 ):
     for p in (docs_dir, sqlite_path):
         check_file_exists(p)
@@ -196,71 +226,104 @@ def batch(
     if output_root is None:
         output_root = docs_dir.parent
     output_root.mkdir(parents=True, exist_ok=True)
+    setup_logging_file_only(output_root / "phen_prior.log", log_level)
+    api_key = load_config(config)
+
+    sample_name = sqlite_path.stem.split(".", 1)[0]
+    pending_docs: List[Path] = []
+    completed = 0
+    for doc in docs:
+        out_dir = output_root / f"result_{sample_name}" / doc.stem
+        if out_dir.exists() and _is_output_complete(out_dir, sample_name):
+            completed += 1
+            continue
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        pending_docs.append(doc)
+
+    total = len(docs)
+    remaining = len(pending_docs)
 
     console = Console()
-    with Progress(
+    console.print(f"Total docs: {total} | Completed: {completed} | Remaining: {remaining}")
+    if not pending_docs:
+        console.print("Nothing to process. Exiting.")
+        raise typer.Exit()
+
+    sem = asyncio.Semaphore(workers)
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=min(workers, cpu_count()))
+
+    bar_progress = Progress(
         SpinnerColumn(),
-        TextColumn("Processing files:"),
         BarColumn(bar_width=None),
         TaskProgressColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=console,
-    ) as progress:
-        task = progress.add_task("Processing files:", total=len(docs))
-        Parallel(n_jobs=workers, prefer="threads")(
-            delayed(_process_doc)(
+    )
+    tail_progress = Progress(TextColumn("{task.description}"), console=console)
+
+    bar_id = bar_progress.add_task("Processing", total=remaining)
+    tail_id = tail_progress.add_task("", total=None)
+
+    with Live(Group(bar_progress, tail_progress), console=console, refresh_per_second=10):
+        coros = [
+            _process_doc_async(
+                sem,
+                loop,
+                executor,
                 doc,
                 sqlite_path,
                 output_root,
-                config,
-                log_level,
-                progress,
-                task,
+                api_key,
+                bar_progress,
+                bar_id,
+                tail_progress,
+                tail_id,
             )
-            for doc in docs
+            for doc in pending_docs
+        ]
+        results = await asyncio.gather(*coros)
+
+    failed = results.count(False)
+    console.print(f"Finished. OK: {remaining - failed} | Failed: {failed}")
+
+
+@app.command()
+def batch(
+    docs_dir: Path = typer.Option(BASE_DIR / "../med_docs", "-d", "--docs-dir"),
+    sqlite_path: Path = typer.Option(BASE_DIR / "../FND00006610.vcf.sqlite", "-s", "--sqlite"),
+    output_root: Optional[Path] = typer.Option(None, "-o", "--output-root"),
+    config: Optional[Path] = typer.Option(BASE_DIR / "data/tokenizer_config.json", "-c", "--config"),
+    log_level: str = typer.Option("info", "--log-level"),
+    workers: int = typer.Option(4, "-w", "--workers"),
+):
+    asyncio.run(
+        _batch_async(
+            docs_dir,
+            sqlite_path,
+            output_root,
+            config,
+            log_level,
+            workers,
         )
+    )
 
 
 @app.command()
 def run(
-    med_doc: Path = typer.Option(
-        BASE_DIR / "../med_docs_test/test.txt",
-        "-m",
-        "--med_doc",
-        help="Path to medical document",
-    ),
-    sqlite_path: Path = typer.Option(
-        BASE_DIR / "../FND00006610.vcf.sqlite",
-        "-s",
-        "--sqlite",
-        help="Path to sqlite",
-    ),
-    config: Optional[Path] = typer.Option(
-        BASE_DIR / "data/tokenizer_config.json",
-        "-c",
-        "--config",
-        help="Path to JSON with API key",
-    ),
-    output_dir: Optional[Path] = typer.Option(
-        None,
-        "-o",
-        "--output_dir",
-        help="Directory for result files (default: <sample_name>)",
-    ),
-    log_level: str = typer.Option(
-        "info", "--log-level", help="Log level (debug, info, warning, error)"
-    ),
-    override: bool = typer.Option(
-        False,
-        "--override",
-        help="Overwrite output directory if it already exists",
-    ),
+    med_doc: Path = typer.Option(BASE_DIR / "../med_docs_test/test.txt", "-m", "--med_doc"),
+    sqlite_path: Path = typer.Option(BASE_DIR / "../FND00006610.vcf.sqlite", "-s", "--sqlite"),
+    config: Optional[Path] = typer.Option(BASE_DIR / "data/tokenizer_config.json", "-c", "--config"),
+    output_dir: Optional[Path] = typer.Option(None, "-o", "--output_dir"),
+    log_level: str = typer.Option("info", "--log-level"),
+    override: bool = typer.Option(False, "--override"),
 ):
     for p in (med_doc, sqlite_path):
         check_file_exists(p)
 
-    sample_name = sqlite_path.stem
+    sample_name = sqlite_path.stem.split(".", 1)[0]
     if output_dir is None:
         output_dir = BASE_DIR / sample_name
 
@@ -269,19 +332,19 @@ def run(
             shutil.rmtree(output_dir)
             output_dir.mkdir()
         else:
-            log.error(
-                f"Output directory {output_dir} already exists. Use --override to overwrite."
-            )
+            log.error(f"Output directory {output_dir} already exists. Use --override to overwrite.")
             raise typer.Exit(code=1)
     else:
         output_dir.mkdir(parents=True)
 
+    setup_logging_file_only(output_dir / "phen_prior.log", log_level)
+    api_key = load_config(config)
+
     Pipeline(
         med_doc,
         sqlite_path,
-        config,
+        api_key,
         output_dir,
-        log_level,
         show_progress=True,
     ).run()
 

@@ -1,20 +1,15 @@
-# modules/hpo_ops.py
 import re
 import subprocess
 import time
-from datetime import datetime
 from pathlib import Path
 import os
 import warnings
 import logging
-
 import shutil
-
-
-
+from typing import Optional
 
 from .utils import log, DeepSeekClient
-from .text_ops import write_text, translate_text
+from .text_ops import write_text
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -22,11 +17,10 @@ warnings.filterwarnings("ignore", message=r"The current process just got forked"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-SAMPLE_NAME = None
-RESULT_DIR = None
+DOCKER_TIMEOUT = 60 * 60
 
 
-def _build_tag_script(sample: str, script_path: Path):
+def _build_tag_script(sample: str, script_path: Path) -> None:
     script_path.write_text(
         f"""#!/usr/bin/bash
 cd /PhenoTagger/src/
@@ -39,106 +33,105 @@ cp ../output/* /mnt/
     )
 
 
-
-
-DOCKER_TIMEOUT = 60 * 60          # 1 час
-
-def _check_docker():
+def _check_docker() -> None:
     if shutil.which("docker") is None:
         raise RuntimeError("Docker binary not found in PATH")
-    try:
-        subprocess.check_output(["docker", "info"], stderr=subprocess.STDOUT, timeout=5)
-    except Exception as e:
-        raise RuntimeError("Docker daemon is not running") from e
+    subprocess.check_output(["docker", "info"], stderr=subprocess.STDOUT, timeout=5)
 
-def execute_phenotagger(text: str) -> str:
+
+def execute_phenotagger(text: str, sample_name: str, result_dir: Path) -> str:
     _check_docker()
 
-    pubtator_path = RESULT_DIR / f"{SAMPLE_NAME}.PubTator"
-    pubtator_path.write_text(f"1|t|description\n1|a|{text}\n\n\n", encoding="utf-8")
+    input_pubtator = result_dir / f"{sample_name}.PubTator"
+    input_pubtator.write_text(f"1|t|description\n1|a|{text}\n\n\n", encoding="utf-8")
 
-    script_path = RESULT_DIR / f"{SAMPLE_NAME}.sh"
-    _build_tag_script(SAMPLE_NAME, script_path)
+    script_path = result_dir / f"{sample_name}.sh"
+    _build_tag_script(sample_name, script_path)
     subprocess.run(["chmod", "+x", script_path.as_posix()], check=True)
 
-    log.info("PhenoTagger: docker run started")
     cmd = [
-        "docker", "run", "--user", "root", "--rm",
-        "-v", f"{RESULT_DIR.resolve()}:/mnt",
+        "docker",
+        "run",
+        "--user",
+        "root",
+        "--rm",
+        "-v",
+        f"{result_dir.resolve()}:/mnt",
         "albertea/phenotagger:1.2",
         f"/mnt/{script_path.name}",
-        "--gpus", "all"
+        "--gpus",
+        "all",
     ]
 
     start = time.time()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    last_line = time.time()
-    try:
-        while True:
-            line = p.stdout.readline()
-            if line:
-                log.debug(f"PhenoTagger | {line.rstrip()}")
-                last_line = time.time()
-            if p.poll() is not None:
-                break
-            if time.time() - last_line > 30:
-                log.info(f"PhenoTagger: still running ({int(time.time()-start)} s)")
-                last_line = time.time()
-            if time.time() - start > DOCKER_TIMEOUT:
-                p.kill()
-                raise RuntimeError("PhenoTagger timeout exceeded")
-        rc = p.wait()
-    finally:
-        if p.stdout:
-            p.stdout.close()
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DOCKER_TIMEOUT)
+    runtime = time.time() - start
+    log.info(f"PhenoTagger finished in {runtime:.1f}s (rc={proc.returncode})")
 
-    if rc != 0:
-        raise RuntimeError("PhenoTagger exited with non-zero status")
+    if proc.returncode != 0:
+        raise RuntimeError(f"PhenoTagger failed: {proc.stderr.strip()}")
 
-    log.info(f"PhenoTagger finished in {time.time()-start:.1f} s, parsing output")
-    cmd_parse = (
-        f'grep ^1 {pubtator_path.name} | sed 1,2d | cut -f 4,6 | '
+    parse_cmd = (
+        f'grep ^1 {input_pubtator.name} | sed "1,2d" | cut -f4,6 | '
         'sed "s+^+*+" | sed "s+\\tHP:+*\\tHP:+"'
     )
     try:
-        return subprocess.check_output(cmd_parse, shell=True, cwd=RESULT_DIR).decode("utf-8").strip()
-    except subprocess.CalledProcessError as e:
-        log.error("Failed to parse PhenoTagger output")
-        raise
+        hpo = subprocess.check_output(parse_cmd, shell=True, cwd=result_dir).decode().strip()
+    except subprocess.CalledProcessError:
+        raise RuntimeError("Failed to parse PhenoTagger output")
 
+    if not hpo:
+        raise RuntimeError("PhenoTagger returned no HPO terms")
 
-def get_hpo(text: str, chat: DeepSeekClient, sample_name: str, result_dir: Path) -> str:
-    global SAMPLE_NAME, RESULT_DIR
-    SAMPLE_NAME = sample_name
-    RESULT_DIR = result_dir
+    numbered_pubtator = result_dir / f"{sample_name}_03_phenotagger.PubTator"
+    if numbered_pubtator.exists():
+        numbered_pubtator.unlink()
+    input_pubtator.rename(numbered_pubtator)
 
-    log.info("Translation to English started")
-    t0 = time.time()
-    eng = translate_text(text, chat)
-    log.info(f"Translation finished in {time.time() - t0:.1f}s")
-    write_text(eng, "_eng", sample_name, result_dir)
+    neg2_src = result_dir / f"{sample_name}.neg2.PubTator"
+    if neg2_src.exists():
+        neg2_dst = result_dir / f"{sample_name}_03_phenotagger.neg2.PubTator"
+        if neg2_dst.exists():
+            neg2_dst.unlink()
+        neg2_src.rename(neg2_dst)
 
-    hpo = execute_phenotagger(eng)
-    write_text(hpo, "_hpo_terms", sample_name, result_dir)
     return hpo
 
 
-def filter_terms(hpo_terms: str, text: str, chat: DeepSeekClient, sample_name: str, result_dir: Path) -> str | None:
+def get_hpo(text: str, chat: DeepSeekClient, sample_name: str, result_dir: Path) -> str:
+    hpo = execute_phenotagger(text, sample_name, result_dir)
+    write_text(hpo, "_03_hpo_terms", sample_name, result_dir)
+    return hpo
+
+
+def filter_terms(
+    hpo_terms: str,
+    text: str,
+    chat: DeepSeekClient,
+    sample_name: str,
+    result_dir: Path,
+) -> Optional[str]:
+    if not hpo_terms:
+        raise ValueError("Empty HPO term list")
+
     prompt = (
-        "Проанализируй текст и сопоставь его с предоставленным набором HPO-термов.\n"
-        "Строго соблюдай правила:\n"
-        "1. Используй только термы из списка; не добавляй новые.\n"
-        "2. Коды HPO не изменяй.\n"
-        "3. Удали термы, не относящиеся к пациенту.\n"
-        "4. Формат: «Название терма код» на каждой новой строке."
+        "Analyze the patient text and match it with the provided HPO term list.\n"
+        "Rules:\n"
+        "1. Use only terms present in the list; do not invent new ones.\n"
+        "2. Preserve HPO codes exactly.\n"
+        "3. Remove terms that do not describe the patient.\n"
+        '4. Output each kept term on its own line as "Term name HP:XXXXXXX".'
     )
-    filtered = chat.ask(f"{text}\n{hpo_terms}", prompt, temperature=0.0)
-    write_text(filtered, "_filtered_terms", sample_name, result_dir)
-    codes = re.findall(r"HP:\d{7}", filtered)
-    return ",".join(codes) if codes else None
+    response = chat.ask(f"{text}\n\nHPO term list:\n{hpo_terms}", prompt, temperature=0.0)
+    write_text(response, "_04_filtered_terms", sample_name, result_dir)
+    codes = re.findall(r"HP:\d{7}", response)
+    return ",".join(dict.fromkeys(codes)) if codes else None
 
 
-def execute_clinprior(terms: str, sample_name: str, result_dir: Path):
+def execute_clinprior(terms: str, sample_name: str, result_dir: Path) -> None:
+    if not terms:
+        raise ValueError("No HPO terms for ClinPrior")
+
     r_script = result_dir / "clinprior_script.r"
     if not r_script.exists():
         raise FileNotFoundError(f"R-script not found: {r_script}")
@@ -147,26 +140,27 @@ def execute_clinprior(terms: str, sample_name: str, result_dir: Path):
     t0 = time.time()
 
     cmd = [
-        "docker", "run",
-        "--platform", "linux/amd64",
+        "docker",
+        "run",
+        "--platform",
+        "linux/amd64",
         "--rm",
-        "-v", f"{result_dir.resolve()}:/mnt",
+        "-v",
+        f"{result_dir.resolve()}:/mnt",
         "aschluterclinprior/clinprior2:latest",
-        "bash", "-c",
-        f"Rscript /mnt/{r_script.name} {terms} {sample_name}"
+        "bash",
+        "-c",
+        f"Rscript /mnt/{r_script.name} {terms} {sample_name}",
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     runtime = time.time() - t0
-    log.info(f"ClinPrior: docker finished in {runtime:.1f}s (rc={result.returncode})")
+    log.info(f"ClinPrior finished in {runtime:.1f}s (rc={proc.returncode})")
 
-    log.debug("ClinPrior stdout:\n" + result.stdout.strip())
-    if result.stderr:
-        log.debug("ClinPrior stderr:\n" + result.stderr.strip())
-
-    if result.returncode != 0:
-        raise RuntimeError("ClinPrior exited with non-zero status")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ClinPrior failed: {proc.stderr.strip()}")
 
     csv_path = result_dir / f"{sample_name}_clinprior.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"ClinPrior CSV not found: {csv_path}")
+    csv_path.rename(result_dir / f"{sample_name}_05_clinprior.csv")
