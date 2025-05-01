@@ -24,14 +24,14 @@ def _build_tag_script(sample: str, script_path: Path) -> None:
     script_path.write_text(
         f"""#!/usr/bin/bash
 cd /PhenoTagger/src/
-rm /PhenoTagger/example/input/*
+rm -f /PhenoTagger/example/input/*
 cp /mnt/{sample}.PubTator /PhenoTagger/example/input/
-python /PhenoTagger/src/PhenoTagger_tagging.py -i ../example/input/ -o ../output/
-cp ../output/* /mnt/
+python /PhenoTagger/src/PhenoTagger_tagging.py -i ../example/input/ -o ../output/ || exit 1
+shopt -s nullglob
+cp ../output/* /mnt/ 2>/dev/null || true
 """,
         encoding="utf-8",
     )
-
 
 def _check_docker() -> None:
     if shutil.which("docker") is None:
@@ -72,7 +72,7 @@ def execute_phenotagger(text: str, sample_name: str, result_dir: Path) -> str:
         raise RuntimeError(f"PhenoTagger failed: {proc.stderr.strip()}")
 
     parse_cmd = (
-        f'grep ^1 {input_pubtator.name} | sed "1,2d" | cut -f4,6 | '
+        f'grep "^1" {input_pubtator.name} | sed "1,2d" | cut -f4,5 | '
         'sed "s+^+*+" | sed "s+\\tHP:+*\\tHP:+"'
     )
     try:
@@ -82,6 +82,8 @@ def execute_phenotagger(text: str, sample_name: str, result_dir: Path) -> str:
 
     if not hpo:
         raise RuntimeError("PhenoTagger returned no HPO terms")
+
+    (result_dir / f"{sample_name}_03_raw_hpo.txt").write_text(hpo, encoding="utf-8")
 
     numbered_pubtator = result_dir / f"{sample_name}_03_phenotagger.PubTator"
     if numbered_pubtator.exists():
@@ -98,7 +100,9 @@ def execute_phenotagger(text: str, sample_name: str, result_dir: Path) -> str:
     return hpo
 
 
+
 def get_hpo(text: str, chat: DeepSeekClient, sample_name: str, result_dir: Path) -> str:
+    text = text.replace("\n", " ")
     hpo = execute_phenotagger(text, sample_name, result_dir)
     write_text(hpo, "_03_hpo_terms", sample_name, result_dir)
     return hpo
